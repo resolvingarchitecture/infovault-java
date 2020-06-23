@@ -5,30 +5,14 @@ import ra.common.content.Content;
 import ra.common.route.Route;
 
 import java.io.*;
-import java.lang.reflect.InvocationTargetException;
 import java.util.*;
 import java.util.logging.Logger;
 
 /**
  * Asynchronous access to the file system as a Service (handleDocument).
- * It only supports DocumentMessage within the supplied Envelope to save as a Content in the Envelope
- * through DLC.getContent():Content.
- * Content is saved as a JSON document as-is with the naming scheme of:
- * Access to an instance of LocalFSInfoVaultDB (InfoVaultDB) is provided in each Service too (by BaseService)
- * for synchronous access.
- * Developer's choice to which to use on a per-case basis by Services extending BaseService.
- * Clients always use this service as they do not have direct access to InfoVaultDB.
- * Consider using this service for heavier higher-latency work by Services extending BaseService vs using their
- * synchronous access instance in BaseService.
- *
- * InfoVault
- * Maintain thread-safe.
- * Use directly synchronously.
- * InfoVaultDB instances are singleton by type when instantiated through InfoVaultService.getInstance(String className).
- * Multiple types can be instantiated in parallel, e.g. LocalFSInfoVaultDB and Neo4jDB
- * Pass in class name (including package) to get an instance of it.
- * Make sure your class implements the InfoVault interface.
- *
+ * It only supports DocumentMessage within the supplied Envelope to save as an InfoVault in the Envelope
+ * through DLC.getContent():InfoVault.
+ * Content is saved as a JSON document as-is.
  */
 public final class InfoVaultService extends BaseService {
 
@@ -36,6 +20,7 @@ public final class InfoVaultService extends BaseService {
 
     public static final String OPERATION_SAVE = "SAVE";
     public static final String OPERATION_LOAD = "LOAD";
+    public static final String OPERATION_DELETE = "DELETE";
 
     public InfoVaultService(MessageProducer producer, ServiceStatusListener serviceStatusListener) {
         super(producer, serviceStatusListener);
@@ -54,63 +39,88 @@ public final class InfoVaultService extends BaseService {
                 if(obj instanceof List) {
                     List list = (List)DLC.getContent(e);
                     for(Object ob : list) {
-                        if(ob instanceof Content) {
-                            save((Content)ob);
+                        if(ob instanceof InfoVault) {
+                            InfoVault infoVault = (InfoVault)ob;
+                            if(infoVault.location==null) {
+                                e.getMessage().addErrorMessage("InfoVault.location is required.");
+                                return;
+                            }
+                            if(infoVault.content==null) {
+                                e.getMessage().addErrorMessage("InfoVault.content is required.");
+                                return;
+                            }
+                            try {
+                                save((InfoVault)ob);
+                            } catch (FileNotFoundException fileNotFoundException) {
+                                e.getMessage().addErrorMessage(fileNotFoundException.getLocalizedMessage());
+                                return;
+                            }
                         } else {
                             LOG.warning("Only Content objects supported within a List.");
                         }
                     }
-                } else if(obj instanceof Content) {
-
+                } else if(obj instanceof InfoVault) {
+                    InfoVault infoVault = (InfoVault)obj;
+                    if(infoVault.location==null) {
+                        e.getMessage().addErrorMessage("InfoVault.location is required.");
+                        return;
+                    }
+                    if(infoVault.content==null) {
+                        e.getMessage().addErrorMessage("InfoVault.content is required.");
+                        return;
+                    }
+                    try {
+                        save((InfoVault)obj);
+                    } catch (FileNotFoundException fileNotFoundException) {
+                        e.getMessage().addErrorMessage(fileNotFoundException.getLocalizedMessage());
+                        return;
+                    }
                 } else {
-                    LOG.warning("Only Content or List<Content> supported.");
+                    LOG.warning("Only InfoVault or List<InfoVault> supported.");
                     return;
                 }
                 break;
             }
             case OPERATION_LOAD: {
-                Content content = (Content)DLC.getContent(e);
+                Object obj = DLC.getContent(e);
+                if(obj instanceof List) {
 
+                } else if(obj instanceof InfoVault) {
+
+                }
+                break;
+            }
+            case OPERATION_DELETE: {
+                Object obj = DLC.getContent(e);
+                if(obj instanceof InfoVault) {
+
+                }
+                break;
             }
             default: deadLetter(e);
         }
     }
 
-    private void save(Content content) {
+    private boolean save(InfoVault infoVault) throws FileNotFoundException {
         LOG.info("Saving content...");
-
-        File path = null;
-        if(label != null) {
-            path = new File(dbDir, label);
-            if(!path.exists()) {
-                if(!autoCreate)
-                    throw new FileNotFoundException("Label doesn't exist and autoCreate = false");
-                else {
-                    path.mkdirs();
-                    path.setWritable(true);
-                }
-            }
+        File path = new File(infoVault.location);
+        if(!path.exists()) {
+            if(!infoVault.autoCreate)
+                throw new FileNotFoundException("InfoVault.location doesn't exist and autoCreate = false");
+            if(!path.mkdirs() ||!path.setWritable(true))
+                throw new FileNotFoundException("Unable to create or set writable InfoVault.location: "+infoVault.location);
         }
-        File file = null;
-        if(path == null)
-            file = new File(dbDir, key);
-        else
-            file = new File(path, key);
-        file.setWritable(true);
-
-        if(!file.exists() && autoCreate) {
-            try {
-                if(!file.createNewFile()) {
-                    LOG.warning("Unable to create new file.");
-                    return;
-                }
-            } catch (IOException e) {
-                LOG.warning(e.getLocalizedMessage());
-                return;
+        File file = new File(path, infoVault.content.getName());
+        try {
+            if(!file.exists() && !file.createNewFile() || !file.setWritable(true)) {
+                throw new FileNotFoundException("Unable to create file or set writable: "+infoVault.content.getName());
             }
+        } catch (IOException e) {
+            throw new FileNotFoundException("Unable to create file: "+infoVault.content.getName());
         }
+
         byte[] buffer = new byte[8 * 1024];
-        ByteArrayInputStream in = new ByteArrayInputStream(content);
+        ByteArrayInputStream in = new ByteArrayInputStream(infoVault.content.toJSON().getBytes());
         FileOutputStream out = new FileOutputStream(file);
         try {
             int b;
@@ -119,7 +129,7 @@ public final class InfoVaultService extends BaseService {
             }
             LOG.info("Content saved.");
         } catch (IOException ex) {
-            LOG.warning(ex.getLocalizedMessage());
+            throw new FileNotFoundException("Unable to persist content: "+file.getAbsolutePath());
         } finally {
             try {
                 out.close();
@@ -128,9 +138,10 @@ public final class InfoVaultService extends BaseService {
                 LOG.warning(e.getLocalizedMessage());
             }
         }
+        return true;
     }
 
-    public Boolean delete(String label, String key) {
+    public Boolean delete(InfoVault infoVault) {
         LOG.info("Deleting content for label: "+label+" and key: "+key);
         File path = new File(dbDir, label);
         if(!path.exists())
@@ -141,7 +152,7 @@ public final class InfoVaultService extends BaseService {
         return file.delete();
     }
 
-    public byte[] load(String label, String key) throws FileNotFoundException {
+    public void load(InfoVault infoVault) throws FileNotFoundException {
         LOG.info("Loading content for label: "+label+" and key: "+key);
         File path = null;
         if(label != null) {
@@ -157,13 +168,13 @@ public final class InfoVaultService extends BaseService {
         else
             file = new File(path, key);
 
-        return loadFile(file);
+        loadFile(file);
     }
 
     @Override
-    public List<byte[]> loadRange(String label, int start, int numberEntries) {
-        LOG.info("Loading range of content for label: "+label);
-        List<byte[]> contentList = new ArrayList<>();
+    public List<InfoVault> loadRange(String location, int start, int numberEntries) {
+        LOG.info("Loading range of content in: "+location);
+        List<InfoVault> contentList = new ArrayList<>();
         File path = null;
         if(label != null) {
             path = new File(dbDir, label);
@@ -199,11 +210,11 @@ public final class InfoVaultService extends BaseService {
     }
 
     @Override
-    public List<byte[]> loadAll(String label) {
-        LOG.info("Loading all content for label: "+label);
-        List<byte[]> contentList = new ArrayList<>();
+    public List<InfoVault> loadAll(String location) {
+        LOG.info("Loading all content for location: "+location);
+        List<InfoVault> contentList = new ArrayList<>();
         File path = null;
-        if(label != null) {
+        if(location != null) {
             path = new File(dbDir, label);
             if(path.exists()) {
                 File[] children = path.listFiles();
